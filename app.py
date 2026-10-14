@@ -37,22 +37,27 @@ def predict_move(uploaded_file):
     image = Image.open(uploaded_file).convert("RGB")
     display_image = image.copy()
 
-    # Match the model's training image dimensions.
-    image = image.resize((150, 150))
-    image_array = np.array(image, dtype=np.float32)
+    # Match TensorFlow's default image resizing interpolation.
+    image = image.resize(
+        (150, 150),
+        resample=Image.Resampling.BILINEAR
+    )
 
-    # The model already has Rescaling(1./255).
+    image_array = np.asarray(image, dtype=np.float32)
     image_array = np.expand_dims(image_array, axis=0)
 
-    probabilities = model.predict(
-        image_array, verbose=0
-    )[0]
+    probabilities = model.predict(image_array, verbose=0)[0]
 
-    predicted_index = int(np.argmax(probabilities))
+    print("Probabilities:", {
+        name: round(float(prob), 4)
+        for name, prob in zip(CLASS_NAMES, probabilities)
+    })
+
+    index = int(np.argmax(probabilities))
 
     return (
-        CLASS_NAMES[predicted_index],
-        float(probabilities[predicted_index]),
+        CLASS_NAMES[index],
+        float(probabilities[index]),
         display_image,
     )
 
