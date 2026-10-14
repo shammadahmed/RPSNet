@@ -1,29 +1,16 @@
-import random
-import numpy as np
 import streamlit as st
 import tensorflow as tf
-from PIL import Image, ImageOps
+import numpy as np
+from PIL import Image
 
-# --------------------------------------------------
-# Configuration
-# --------------------------------------------------
 st.set_page_config(
     page_title="Rock Paper Scissors",
     page_icon="✊",
-    layout="centered",
+    layout="wide"
 )
 
-MODEL_PATH = "rock_paper_scissors.keras"
-IMAGE_SIZE = (150, 150)
-
-# Must match the class order used during model training.
+# These labels must match the order used during training.
 CLASS_NAMES = ["paper", "rock", "scissors"]
-
-EMOJI = {
-    "rock": "✊",
-    "paper": "✋",
-    "scissors": "✌️",
-}
 
 WINNING_MOVES = {
     "rock": "scissors",
@@ -31,213 +18,133 @@ WINNING_MOVES = {
     "scissors": "paper",
 }
 
+EMOJI = {
+    "rock": "✊",
+    "paper": "✋",
+    "scissors": "✌️",
+}
 
-# --------------------------------------------------
-# Load model
-# --------------------------------------------------
 @st.cache_resource
 def load_model():
-    return tf.keras.models.load_model(MODEL_PATH)
+    return tf.keras.models.load_model(
+        "rock_paper_scissors_new.keras"
+    )
+
+model = load_model()
 
 
-# --------------------------------------------------
-# Image preprocessing
-# --------------------------------------------------
-def preprocess_image(image: Image.Image) -> np.ndarray:
-    image = ImageOps.exif_transpose(image)
-    image = image.convert("RGB")
-    image = image.resize(IMAGE_SIZE)
+def predict_move(uploaded_file):
+    image = Image.open(uploaded_file).convert("RGB")
+    display_image = image.copy()
 
-    # The model already contains Rescaling(1./255).
-    # Do not normalize the image a second time.
+    # Match TensorFlow's default image resizing interpolation.
+    image = image.resize(
+        (150, 150),
+        resample=Image.Resampling.BILINEAR
+    )
+
     image_array = np.asarray(image, dtype=np.float32)
+    image_array = np.expand_dims(image_array, axis=0)
 
-    return np.expand_dims(image_array, axis=0)
+    probabilities = model.predict(image_array, verbose=0)[0]
 
+    print("Probabilities:", {
+        name: round(float(prob), 4)
+        for name, prob in zip(CLASS_NAMES, probabilities)
+    })
 
-# --------------------------------------------------
-# Predict hand gesture
-# --------------------------------------------------
-def predict_move(image: Image.Image, model):
-    processed_image = preprocess_image(image)
+    index = int(np.argmax(probabilities))
 
-    probabilities = model.predict(
-        processed_image,
-        verbose=0,
-    )[0]
-
-    if len(probabilities) != len(CLASS_NAMES):
-        raise ValueError(
-            "Model output count does not match CLASS_NAMES."
-        )
-
-    predicted_index = int(np.argmax(probabilities))
-    predicted_move = CLASS_NAMES[predicted_index]
-
-    return predicted_move, probabilities
-
-
-# --------------------------------------------------
-# Determine winner
-# --------------------------------------------------
-def decide_winner(player_move: str, computer_move: str) -> str:
-    if player_move == computer_move:
-        return "draw"
-
-    if WINNING_MOVES[player_move] == computer_move:
-        return "player"
-
-    return "computer"
-
-
-# --------------------------------------------------
-# Streamlit interface
-# --------------------------------------------------
-st.title("✊ Rock Paper Scissors")
-st.write("Upload a hand image and play against the computer!")
-
-with st.expander("Tips for better predictions"):
-    st.markdown(
-        """
-        - Keep your hand fully visible and centered.
-        - Use a clear image with good lighting.
-        - Avoid cluttered backgrounds where possible.
-        - The model may struggle with photos that differ
-          significantly from its training dataset.
-        """
+    return (
+        CLASS_NAMES[index],
+        float(probabilities[index]),
+        display_image,
     )
 
-# Load model safely.
-try:
-    model = load_model()
-except Exception as exc:
-    st.error(
-        f"Could not load `{MODEL_PATH}`. "
-        "Ensure the model file exists in your repository."
-    )
 
-    with st.expander("Technical details"):
-        st.code(str(exc))
+def get_result(move1, move2):
+    if move1 == move2:
+        return "It's a draw! 🤝"
 
-    st.stop()
+    if WINNING_MOVES[move1] == move2:
+        return "Player 1 wins! 🏆"
+
+    return "Player 2 wins! 🏆"
 
 
-# Upload image.
-uploaded_file = st.file_uploader(
-    "Choose an image",
-    type=["jpg", "jpeg", "png", "webp"],
+st.title("✊ Rock Paper Scissors ✋")
+st.write(
+    "Upload a hand image for each player. "
+    "Our CNN predicts both moves and decides the winner."
 )
 
-if uploaded_file is not None:
-    try:
-        image = Image.open(uploaded_file)
-        image = ImageOps.exif_transpose(image).convert("RGB")
-    except Exception:
-        st.error("Could not open this image. Please try another.")
-        st.stop()
+st.info(
+    "Show one clear rock, paper, or scissors hand gesture "
+    "in each image."
+)
 
-    st.image(
-        image,
-        caption="Your uploaded hand image",
-        use_container_width=True,
+col1, col2 = st.columns(2)
+
+with col1:
+    st.subheader("🔵 Player 1")
+    file1 = st.file_uploader(
+        "Upload Player 1's hand",
+        type=["jpg", "jpeg", "png"],
+        key="player1",
     )
 
-    if st.button(
-        "Play Round",
-        type="primary",
-        use_container_width=True,
-    ):
+with col2:
+    st.subheader("🔴 Player 2")
+    file2 = st.file_uploader(
+        "Upload Player 2's hand",
+        type=["jpg", "jpeg", "png"],
+        key="player2",
+    )
+
+if file1 is not None and file2 is not None:
+    if st.button("🎮 Play Round", type="primary",
+                 use_container_width=True):
+
         try:
-            player_move, probabilities = predict_move(
-                image,
-                model,
-            )
+            with st.spinner("Analyzing both hand images..."):
+                move1, confidence1, image1 = predict_move(file1)
+                move2, confidence2, image2 = predict_move(file2)
 
-            computer_move = random.choice(CLASS_NAMES)
+            st.divider()
+            result_col1, result_col2 = st.columns(2)
 
-            outcome = decide_winner(
-                player_move,
-                computer_move,
-            )
+            with result_col1:
+                st.image(image1, caption="Player 1")
+                st.markdown(
+                    f"### {EMOJI[move1]} {move1.title()}"
+                )
+                st.metric(
+                    "Prediction confidence",
+                    f"{confidence1:.1%}"
+                )
 
-            st.session_state["rps_result"] = {
-                "player_move": player_move,
-                "computer_move": computer_move,
-                "probabilities": probabilities.tolist(),
-                "outcome": outcome,
-            }
+            with result_col2:
+                st.image(image2, caption="Player 2")
+                st.markdown(
+                    f"### {EMOJI[move2]} {move2.title()}"
+                )
+                st.metric(
+                    "Prediction confidence",
+                    f"{confidence2:.1%}"
+                )
 
-        except Exception as exc:
-            st.error("Prediction failed. Please try another image.")
+            st.divider()
+            st.subheader("🏆 Game Result")
+            result = get_result(move1, move2)
 
-            with st.expander("Technical details"):
-                st.code(str(exc))
+            if move1 == move2:
+                st.warning(result)
+            else:
+                st.success(result)
+                st.balloons()
 
-
-# --------------------------------------------------
-# Display round result
-# --------------------------------------------------
-if "rps_result" in st.session_state:
-    result = st.session_state["rps_result"]
-
-    player_move = result["player_move"]
-    computer_move = result["computer_move"]
-    probabilities = result["probabilities"]
-    outcome = result["outcome"]
-
-    st.divider()
-    st.subheader("Round Result")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.metric(
-            "Your Move",
-            f"{EMOJI[player_move]} {player_move.title()}",
-        )
-
-    with col2:
-        st.metric(
-            "Computer's Move",
-            f"{EMOJI[computer_move]} {computer_move.title()}",
-        )
-
-    if outcome == "player":
-        st.success("🎉 You win!")
-
-    elif outcome == "computer":
-        st.error("🤖 The computer wins!")
-
-    else:
-        st.info("🤝 It's a draw!")
-
-    # Display model scores for debugging.
-    st.subheader("Prediction Confidence")
-
-    st.caption(
-        "These scores show the model's output, not a guarantee "
-        "that its prediction is correct."
-    )
-
-    for class_name, probability in zip(
-        CLASS_NAMES,
-        probabilities,
-    ):
-        st.write(
-            f"{EMOJI[class_name]} "
-            f"{class_name.title()}: {probability:.2%}"
-        )
-
-        st.progress(
-            float(np.clip(probability, 0.0, 1.0))
-        )
-
-    if st.button("Clear Round", use_container_width=True):
-        del st.session_state["rps_result"]
-        st.rerun()
+        except Exception as error:
+            st.error(f"Could not process the images: {error}")
 
 else:
-    st.info("Upload an image and click Play Round to begin.")
-
-st.divider()
-st.caption("Built with Streamlit and TensorFlow.")
+    st.caption("Upload both images to start playing.")
