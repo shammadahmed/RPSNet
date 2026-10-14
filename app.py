@@ -1,4 +1,3 @@
-```python
 import random
 import numpy as np
 import streamlit as st
@@ -242,4 +241,3 @@ else:
 
 st.divider()
 st.caption("Built with Streamlit and TensorFlow.")
-```
