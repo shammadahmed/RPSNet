@@ -27,7 +27,7 @@ EMOJI = {
 @st.cache_resource
 def load_model():
     return tf.keras.models.load_model(
-        "rock_paper_scissors_new.keras"
+        "rock_paper_scissors_new_2.keras"
     )
 
 model = load_model()
