@@ -1,6 +1,7 @@
 import streamlit as st
 import tensorflow as tf
 import numpy as np
+from collections import deque
 from pathlib import Path
 from PIL import Image, ImageOps, ImageFilter
 
@@ -56,12 +57,66 @@ def get_model_target_size(loaded_model):
     return (150, 150)
 
 
+def _erode_numpy(m: np.ndarray, r: int) -> np.ndarray:
+    h, w = m.shape
+    out = m.copy()
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dx * dx + dy * dy <= r * r + 1:
+                s = np.zeros_like(m)
+                s[max(0, dy) : min(h, h + dy), max(0, dx) : min(w, w + dx)] = m[
+                    max(0, -dy) : min(h, h - dy), max(0, -dx) : min(w, w - dx)
+                ]
+                out &= s
+    return out
+
+
+def _dilate_numpy(m: np.ndarray, r: int) -> np.ndarray:
+    h, w = m.shape
+    out = m.copy()
+    for dy in range(-r, r + 1):
+        for dx in range(-r, r + 1):
+            if dx * dx + dy * dy <= r * r + 1:
+                s = np.zeros_like(m)
+                s[max(0, dy) : min(h, h + dy), max(0, dx) : min(w, w + dx)] = m[
+                    max(0, -dy) : min(h, h - dy), max(0, -dx) : min(w, w - dx)
+                ]
+                out |= s
+    return out
+
+
+def _find_connected_components(mask: np.ndarray):
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    components = []
+    for r in range(h):
+        for c in range(w):
+            if mask[r, c] and not visited[r, c]:
+                q = deque([(r, c)])
+                visited[r, c] = True
+                ys, xs = [], []
+                while q:
+                    cy, cx = q.popleft()
+                    ys.append(cy)
+                    xs.append(cx)
+                    for ny in (cy - 1, cy, cy + 1):
+                        for nx in (cx - 1, cx, cx + 1):
+                            if (
+                                0 <= ny < h
+                                and 0 <= nx < w
+                                and mask[ny, nx]
+                                and not visited[ny, nx]
+                            ):
+                                visited[ny, nx] = True
+                                q.append((ny, nx))
+                components.append((np.array(ys), np.array(xs)))
+    return components
+
+
 def _convex_hull_solidity(hand_region: np.ndarray) -> float:
-    """Compute 2D foreground solidity (foreground_area / convex_hull_area) in pure NumPy."""
     h_ys, h_xs = np.where(hand_region)
     if len(h_xs) < 80:
         return 1.0
-
     fg_area = float(len(h_xs))
     unique_rows = np.unique(h_ys)
     pts = []
@@ -91,173 +146,243 @@ def _convex_hull_solidity(hand_region: np.ndarray) -> float:
     hull = lower[:-1] + upper[:-1]
     if len(hull) < 3:
         return 1.0
-
     hx = np.array([p[0] for p in hull])
     hy = np.array([p[1] for p in hull])
-    hull_area = 0.5 * float(np.abs(np.dot(hx, np.roll(hy, 1)) - np.dot(hy, np.roll(hx, 1))))
+    hull_area = 0.5 * float(
+        np.abs(np.dot(hx, np.roll(hy, 1)) - np.dot(hy, np.roll(hx, 1)))
+    )
     return fg_area / max(hull_area, 1.0)
 
 
-def _count_finger_runs(hand_region: np.ndarray, hand_w: int) -> int:
-    """Count distinct extended finger segments across slices in the upper half of the hand."""
-    min_run = max(2, int(0.04 * hand_w))
-    row_counts = []
-    for frac in np.linspace(0.12, 0.48, 9):
-        r = int(frac * hand_region.shape[0])
-        if 0 <= r < hand_region.shape[0]:
-            row = hand_region[r, :]
-            padded = np.concatenate([[False], row, [False]])
-            starts = np.where(padded[1:] & ~padded[:-1])[0]
-            ends = np.where(~padded[1:] & padded[:-1])[0]
-            widths = ends - starts
-            row_counts.append(int(np.sum(widths >= min_run)))
-    return int(np.percentile(row_counts, 75)) if row_counts else 1
-
-
-def locate_and_crop_hand(pil_img: Image.Image, target_size: tuple[int, int]):
+def locate_and_crop_hand(
+    pil_img: Image.Image,
+    target_size: tuple[int, int],
+    enable_auto_crop: bool = True,
+):
     """
-    1. Applies ImageOps.autocontrast to fix foggy / low-contrast webcam photos.
-    2. Segments the hand from the background wall (even when off-center on the left/right edge).
-    3. Trims off the lower forearm so the 1:1 crop centers tightly on the hand/fist.
-    4. Returns (model_input_img, preview_img, geom_probs).
+    1. Detects human skin in YCbCr + RGB space while ignoring white walls, shirts, ties, and furniture.
+    2. Masks out detected faces (via OpenCV Haar cascade if installed + hair/beard-bounded head mask)
+       so the crop locks onto the foreground hand rather than the player's face or background wall.
+    3. Applies contrast normalization only on hazy/washed-out frames (std < 35).
     """
-    enhanced = ImageOps.autocontrast(pil_img, cutoff=1)
+    orig_w, orig_h = pil_img.size
+    full_arr = np.asarray(pil_img, dtype=np.float32)
+    is_hazy = float(full_arr.std()) < 35.0
+
+    if not enable_auto_crop:
+        base_img = ImageOps.autocontrast(pil_img, cutoff=1) if is_hazy else pil_img
+        return (
+            ImageOps.fit(base_img, target_size, method=Image.Resampling.BILINEAR),
+            ImageOps.fit(base_img, (360, 360), method=Image.Resampling.BILINEAR),
+            None,
+        )
+
     work_w = 240
-    work_h = max(60, int(enhanced.height * (work_w / max(enhanced.width, 1))))
-    small = enhanced.resize((work_w, work_h), resample=Image.Resampling.BILINEAR)
-    small_blur = small.filter(ImageFilter.GaussianBlur(radius=2))
-    arr = np.asarray(small_blur, dtype=np.float32)
+    work_h = max(90, int(orig_h * (work_w / max(orig_w, 1))))
+    small_pil = pil_img.resize(
+        (work_w, work_h), resample=Image.Resampling.BILINEAR
+    ).filter(ImageFilter.GaussianBlur(radius=1.0))
+    img_np = np.asarray(small_pil, dtype=np.float32)
 
-    # Sample background from top and cleanest upper side border (avoiding bottom where arm enters)
-    top_strip = arr[:max(1, int(work_h * 0.08)), :, :].reshape(-1, 3)
-    left_strip = arr[:int(work_h * 0.70), :max(1, int(work_w * 0.08)), :].reshape(-1, 3)
-    right_strip = arr[:int(work_h * 0.70), max(0, int(work_w * 0.92)):, :].reshape(-1, 3)
+    r, g, b = img_np[:, :, 0], img_np[:, :, 1], img_np[:, :, 2]
+    ycbcr = np.asarray(small_pil.convert("YCbCr"), dtype=np.float32)
+    y_ch, cb, cr = ycbcr[:, :, 0], ycbcr[:, :, 1], ycbcr[:, :, 2]
 
-    top_med = np.median(top_strip, axis=0)
-    left_med = np.median(left_strip, axis=0)
-    right_med = np.median(right_strip, axis=0)
-    if np.linalg.norm(left_med - top_med) <= np.linalg.norm(right_med - top_med):
-        bg_pixels = np.concatenate([top_strip, left_strip], axis=0)
-    else:
-        bg_pixels = np.concatenate([top_strip, right_strip], axis=0)
-    bg_color = np.median(bg_pixels, axis=0)
+    # 1. Build face exclusion mask so a player's face in the background never pulls the hand crop box
+    face_mask = np.zeros((work_h, work_w), dtype=bool)
+    detected_cv2_face = False
+    try:
+        import cv2
 
-    diff = arr - bg_color
-    dist = np.sqrt(
-        0.30 * (diff[:, :, 0] ** 2)
-        + 0.59 * (diff[:, :, 1] ** 2)
-        + 0.11 * (diff[:, :, 2] ** 2)
-        + np.linalg.norm(diff, axis=-1) ** 2
+        gray_full = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2GRAY)
+        cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        faces = cascade.detectMultiScale(
+            gray_full, scaleFactor=1.08, minNeighbors=3, minSize=(30, 30)
+        )
+        sx, sy = work_w / float(orig_w), work_h / float(orig_h)
+        for fx, fy, fw, fh in faces:
+            detected_cv2_face = True
+            x1 = max(0, int((fx + 0.06 * fw) * sx))
+            x2 = min(work_w, int((fx + 1.10 * fw) * sx))
+            y1 = max(0, int((fy - 0.15 * fh) * sy))
+            y2 = min(work_h, int((fy + 1.25 * fh) * sy))
+            face_mask[y1:y2, x1:x2] = True
+    except Exception:
+        pass
+
+    # Pure-NumPy fallback face mask: detects skin columns bounded above by hair and below by beard/collar
+    if not detected_cv2_face:
+        dark_mask = y_ch < 58
+        for c in range(int(0.15 * work_w), int(0.90 * work_w)):
+            col_dark = np.where(dark_mask[: int(0.75 * work_h), c])[0]
+            if len(col_dark) >= 6:
+                top_hair = col_dark[col_dark < int(0.28 * work_h)]
+                bot_beard = col_dark[
+                    (col_dark > int(0.42 * work_h)) & (col_dark < int(0.72 * work_h))
+                ]
+                if len(top_hair) >= 3 and len(bot_beard) >= 3:
+                    hy1, hy2 = int(top_hair.max()), int(bot_beard.min())
+                    if hy2 - hy1 > int(0.15 * work_h):
+                        col_skin_rg = float(
+                            np.median(r[hy1:hy2, c] - g[hy1:hy2, c])
+                        )
+                        if (
+                            10.0 <= col_skin_rg <= 25.0
+                            and float(np.median(y_ch[hy1:hy2, c])) < 105.0
+                        ):
+                            face_mask[
+                                max(0, hy1 - 5) : min(work_h, hy2 + 10), c
+                            ] = True
+
+    # 2. YCbCr + RGB skin chrominance mask (ignores white walls, white shirts, dark ties, and furniture)
+    skin_indoor = (
+        (cr >= 134)
+        & (cr <= 178)
+        & (cb >= 85)
+        & (cb <= 135)
+        & ((r - g) >= 12)
+        & (r > b)
+        & (y_ch >= 45)
+        & (y_ch <= 225)
     )
+    skin_indoor &= ~face_mask
+    skin_indoor[: int(0.07 * work_h), :] = False
 
-    d_min, d_max = float(dist.min()), float(dist.max())
-    if d_max - d_min < 5.0:
+    # Open first to remove thin wall text ("PASSION") and bridges, then pick the foreground hand blob
+    opened = _dilate_numpy(_erode_numpy(skin_indoor, r=2), r=2)
+    comps = _find_connected_components(opened)
+
+    best_comp = None
+    best_score = -1.0
+    for ys, xs in comps:
+        area = len(xs)
+        if area < 0.025 * (work_w * work_h):
+            continue
+        ymin, ymax = int(ys.min()), int(ys.max())
+        if ymin <= int(0.08 * work_h) + 2 and ymax < int(0.55 * work_h):
+            continue
+        score = float(area) * (1.6 if ymax >= int(0.60 * work_h) else 0.6)
+        if score > best_score:
+            best_score = score
+            best_comp = (ys, xs)
+
+    # 3. Fallback for ultra-hazy uniform-wall images where raw R-G < 12 before contrast normalization
+    if best_comp is None and is_hazy:
+        enh_pil = ImageOps.autocontrast(small_pil, cutoff=1)
+        enh_np = np.asarray(enh_pil, dtype=np.float32)
+        top_s = enh_np[: max(1, int(work_h * 0.08)), :, :].reshape(-1, 3)
+        left_s = enh_np[: int(work_h * 0.70), : max(1, int(work_w * 0.08)), :].reshape(
+            -1, 3
+        )
+        bg_med = np.median(np.concatenate([top_s, left_s], axis=0), axis=0)
+        dist = np.linalg.norm(enh_np - bg_med, axis=-1)
+        d_min, d_max = float(dist.min()), float(dist.max())
+        dist_u8 = np.clip(
+            (dist - d_min) / max(d_max - d_min, 1.0) * 255.0, 0, 255
+        ).astype(np.uint8)
+        hist = np.bincount(dist_u8.ravel(), minlength=256).astype(np.float64)
+        w_bg = np.cumsum(hist)
+        w_fg = dist_u8.size - w_bg
+        s_bg = np.cumsum(np.arange(256) * hist)
+        s_tot = s_bg[-1]
+        v = (w_bg > 0) & (w_fg > 0)
+        m_bg, m_fg = np.zeros(256), np.zeros(256)
+        m_bg[v] = s_bg[v] / w_bg[v]
+        m_fg[v] = (s_tot - s_bg[v]) / w_fg[v]
+        otsu_t = int(np.argmax(w_bg * w_fg * ((m_bg - m_fg) ** 2)))
+        fb_opened = _dilate_numpy(_erode_numpy(dist_u8 > otsu_t, r=2), r=2)
+        fb_comps = _find_connected_components(fb_opened)
+        if fb_comps:
+            best_comp = max(fb_comps, key=lambda c: len(c[0]))
+
+    if best_comp is None:
+        base_img = ImageOps.autocontrast(pil_img, cutoff=1) if is_hazy else pil_img
         return (
-            ImageOps.fit(enhanced, target_size, method=Image.Resampling.BILINEAR),
-            ImageOps.fit(enhanced, (400, 400), method=Image.Resampling.BILINEAR),
+            ImageOps.fit(base_img, target_size, method=Image.Resampling.BILINEAR),
+            ImageOps.fit(base_img, (360, 360), method=Image.Resampling.BILINEAR),
             None,
         )
 
-    # Otsu threshold on background distance map
-    dist_u8 = np.clip((dist - d_min) / (d_max - d_min) * 255.0, 0, 255).astype(np.uint8)
-    hist = np.bincount(dist_u8.ravel(), minlength=256).astype(np.float64)
-    total = dist_u8.size
-    sum_total = np.dot(np.arange(256), hist)
-    weight_bg = np.cumsum(hist)
-    weight_fg = total - weight_bg
-    sum_bg = np.cumsum(np.arange(256) * hist)
-    valid = (weight_bg > 0) & (weight_fg > 0)
-    mean_bg = np.zeros(256)
-    mean_fg = np.zeros(256)
-    mean_bg[valid] = sum_bg[valid] / weight_bg[valid]
-    mean_fg[valid] = (sum_total - sum_bg[valid]) / weight_fg[valid]
-    var_between = weight_bg * weight_fg * ((mean_bg - mean_fg) ** 2)
-    thresh = int(np.argmax(var_between))
-    mask = dist_u8 > thresh
+    # Close only the selected hand component to fill dark shadow lines between curled fingers
+    comp_mask = np.zeros((work_h, work_w), dtype=bool)
+    comp_mask[best_comp[0], best_comp[1]] = True
+    comp_closed = _erode_numpy(_dilate_numpy(comp_mask, r=4), r=4)
+    ys, xs = np.where(comp_closed)
 
-    ys, xs = np.where(mask)
-    if len(xs) < 0.03 * total:
-        return (
-            ImageOps.fit(enhanced, target_size, method=Image.Resampling.BILINEAR),
-            ImageOps.fit(enhanced, (400, 400), method=Image.Resampling.BILINEAR),
-            None,
-        )
+    ymin, ymax = int(ys.min()), int(ys.max())
+    xmin, xmax = int(xs.min()), int(xs.max())
 
-    ymin, ymax = int(np.percentile(ys, 1)), int(np.percentile(ys, 99))
-    upper_cut = ymin + int(0.65 * (ymax - ymin))
-    upper_mask = mask.copy()
-    upper_mask[upper_cut:, :] = False
-    u_ys, u_xs = np.where(upper_mask)
-    if len(u_xs) < 50:
-        return (
-            ImageOps.fit(enhanced, target_size, method=Image.Resampling.BILINEAR),
-            ImageOps.fit(enhanced, (400, 400), method=Image.Resampling.BILINEAR),
-            None,
-        )
+    # Measure upper 78% width (includes outstretched thumb on open palm, trims only long forearms)
+    upper_cut = ymin + int(0.78 * (ymax - ymin))
+    u_xs = xs[ys <= upper_cut]
+    hand_w = max(20, xmax - xmin)
+    if len(u_xs) > 30:
+        hand_xmin = int(np.percentile(u_xs, 1))
+        hand_xmax = int(np.percentile(u_xs, 99))
+        hand_w = max(20, hand_xmax - hand_xmin)
+        if (ymax - ymin) > 1.28 * hand_w:
+            ymax = min(ymax, ymin + int(1.20 * hand_w))
+        trimmed_xs = xs[ys <= ymax]
+        xmin = int(np.percentile(trimmed_xs, 1))
+        xmax = int(np.percentile(trimmed_xs, 99))
 
-    hand_xmin = int(np.percentile(u_xs, 2))
-    hand_xmax = int(np.percentile(u_xs, 98))
-    hand_w = max(15, hand_xmax - hand_xmin)
+    # On hazy plain-wall shots, check if the closed contour is an unambiguous compact fist (Rock)
+    hazy_prior = None
+    if is_hazy:
+        hand_region = comp_closed[ymin : ymax + 1, xmin : xmax + 1]
+        solidity = _convex_hull_solidity(hand_region)
+        if solidity >= 0.88:
+            hazy_prior = np.array([0.05, 0.90, 0.05], dtype=np.float32)
+        elif solidity <= 0.68:
+            hazy_prior = np.array([0.88, 0.05, 0.07], dtype=np.float32)
 
-    # Isolate upper hand/fist region (trimming lower forearm) for geometry analysis
-    hand_ymax = min(work_h - 1, ymin + int(1.05 * hand_w))
-    hand_region = mask[ymin : hand_ymax + 1, hand_xmin : hand_xmax + 1]
+    scale_x = orig_w / float(work_w)
+    scale_y = orig_h / float(work_h)
+    ox1, ox2 = xmin * scale_x, xmax * scale_x
+    oy1, oy2 = ymin * scale_y, ymax * scale_y
 
-    solidity = _convex_hull_solidity(hand_region)
-    max_fingers = _count_finger_runs(hand_region, hand_w)
-
-    geom_probs = None
-    # Class order: ["paper", "rock", "scissors"]
-    if solidity >= 0.83 and max_fingers <= 1:
-        # Compact closed fist with no separated finger projections -> Rock
-        geom_probs = np.array([0.03, 0.92, 0.05], dtype=np.float32)
-    elif solidity < 0.72 or max_fingers >= 3:
-        # Wide splayed fingers with large inter-finger gaps -> Paper
-        geom_probs = np.array([0.92, 0.03, 0.05], dtype=np.float32)
-    elif max_fingers == 2 or (0.72 <= solidity < 0.83):
-        # Two extended fingers -> Scissors
-        geom_probs = np.array([0.08, 0.07, 0.85], dtype=np.float32)
-
-    # Map tight hand bounding box back to original image resolution
-    scale_x = enhanced.width / float(work_w)
-    scale_y = enhanced.height / float(work_h)
-    orig_xmin = hand_xmin * scale_x
-    orig_xmax = hand_xmax * scale_x
-    orig_ymin = ymin * scale_y
-    orig_ymax = min(enhanced.height, (ymin + int(1.20 * hand_w)) * scale_y)
-
-    cx = (orig_xmin + orig_xmax) / 2.0
-    cy = (orig_ymin + orig_ymax) / 2.0
-    side = max(orig_xmax - orig_xmin, orig_ymax - orig_ymin) * 1.35
+    cx = (ox1 + ox2) / 2.0
+    cy = (oy1 + oy2) / 2.0
+    side = max(ox2 - ox1, oy2 - oy1) * 1.15
     half = side / 2.0
-    x1 = int(max(0, cx - half))
-    y1 = int(max(0, cy - half))
-    x2 = int(min(enhanced.width, cx + half))
-    y2 = int(min(enhanced.height, cy + half))
 
-    cropped = enhanced.crop((x1, y1, x2, y2))
-    model_input_img = ImageOps.fit(cropped, target_size, method=Image.Resampling.BILINEAR)
-    preview_img = ImageOps.fit(cropped, (400, 400), method=Image.Resampling.BILINEAR)
-    return model_input_img, preview_img, geom_probs
+    # Clamp square crop inside image bounds so the hand is centered without stretching
+    x1 = max(0.0, min(orig_w - side, cx - half))
+    y1 = max(0.0, min(orig_h - side, cy - half))
+    x2 = min(float(orig_w), x1 + side)
+    y2 = min(float(orig_h), y1 + side)
+
+    cropped = pil_img.crop((int(x1), int(y1), int(x2), int(y2)))
+    if is_hazy:
+        cropped = ImageOps.autocontrast(cropped, cutoff=1)
+
+    model_input_img = ImageOps.fit(
+        cropped, target_size, method=Image.Resampling.BILINEAR
+    )
+    preview_img = ImageOps.fit(cropped, (360, 360), method=Image.Resampling.BILINEAR)
+    return model_input_img, preview_img, hazy_prior
 
 
-def predict_move(uploaded_file):
-    # 1. Open image and apply EXIF orientation transpose for mobile photos
+def predict_move(uploaded_file, enable_auto_crop: bool = True):
     raw_image = Image.open(uploaded_file)
     image = ImageOps.exif_transpose(raw_image).convert("RGB")
 
-    # 2. Auto-crop around the hand (even if off-center), trim forearm, and normalize contrast
     target_size = get_model_target_size(model)
-    model_input_img, cropped_preview, geom_probs = locate_and_crop_hand(image, target_size)
+    model_input_img, cropped_preview, hazy_prior = locate_and_crop_hand(
+        image, target_size, enable_auto_crop=enable_auto_crop
+    )
 
     image_array = np.asarray(model_input_img, dtype=np.float32)
     image_array = np.expand_dims(image_array, axis=0)
 
     cnn_probs = model.predict(image_array, verbose=0)[0].astype(np.float32)
 
-    # 3. Fuse CNN probabilities with hand-contour geometry prior when background is clean
-    if geom_probs is not None:
-        probabilities = 0.40 * cnn_probs + 0.60 * geom_probs
+    # Let the trained CNN drive predictions on normal indoor photos; only apply a gentle
+    # solidity tie-breaker on washed-out/hazy plain-wall images
+    if hazy_prior is not None:
+        probabilities = 0.55 * cnn_probs + 0.45 * hazy_prior
         probabilities = probabilities / np.sum(probabilities)
     else:
         probabilities = cnn_probs
@@ -301,14 +426,17 @@ def render_player_input(player_label, key_prefix):
 
 
 def render_player_result(player_name, move, confidence, preview_img, prob_dict):
-    st.image(preview_img, caption=f"{player_name} (Auto-Cropped & Contrast-Enhanced Hand)", width=320)
+    st.image(
+        preview_img,
+        caption=f"{player_name} (Detected Hand Crop)",
+        width=300,
+    )
     st.markdown(f"### {EMOJI[move]} {move.title()}")
     st.metric("Prediction confidence", f"{confidence:.1%}")
 
     if confidence < LOW_CONFIDENCE_THRESHOLD:
         st.warning(
-            "Low confidence prediction. Try holding your hand against a plain background "
-            "with clear lighting."
+            "Low confidence prediction. Try holding your hand clearly in the foreground."
         )
 
     with st.expander("See all class probabilities"):
@@ -321,10 +449,13 @@ def render_player_result(player_name, move, confidence, preview_img, prob_dict):
 st.title("✊ Rock Paper Scissors ✋")
 st.write(
     "Upload or snap a hand image for each player. "
-    "Our detector isolates each hand, enhances contrast, and predicts the winner."
+    "Our CNN isolates each hand and decides the winner."
 )
-st.info(
-    "Show one clear rock, paper, or scissors hand gesture against a simple background."
+
+enable_auto_crop = st.checkbox(
+    "Auto-detect and crop around hand",
+    value=True,
+    help="Automatically locates the foreground hand and excludes background walls/faces.",
 )
 
 col1, col2 = st.columns(2)
@@ -337,8 +468,12 @@ if file1 is not None and file2 is not None:
     if st.button("🎮 Play Round", type="primary", use_container_width=True):
         try:
             with st.spinner("Analyzing both hand images..."):
-                move1, confidence1, image1, probs1 = predict_move(file1)
-                move2, confidence2, image2, probs2 = predict_move(file2)
+                move1, confidence1, image1, probs1 = predict_move(
+                    file1, enable_auto_crop=enable_auto_crop
+                )
+                move2, confidence2, image2, probs2 = predict_move(
+                    file2, enable_auto_crop=enable_auto_crop
+                )
 
             st.divider()
             result_col1, result_col2 = st.columns(2)
